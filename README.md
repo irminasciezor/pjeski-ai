@@ -2,12 +2,6 @@
 Rozpoznawanie ras psów ze zdjęć
 
 Twórcy:
-Agnieszka P
-Irmina Ś
+Agnieszka P 64682 dsw64682@student.ideis.pl
+Irmina Ś 64165 dsw64165@student.ideis.pl
 
-
-AI Disclaimer:
-Do stworzenia tego projektu użyto narzędzi AI do:
-- planowania pracy, 
-- nauki oraz researchu podczas tworzenia architektury
-- debugowania kodu.
