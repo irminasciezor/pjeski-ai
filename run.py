@@ -8,7 +8,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 
+from analiza_bledow import analiza_bledow
 from logowanie import TreningLog
+from metryki import ewaluuj
 from models import build_resnet18, build_resnet50, build_mobilenet
 from przygotowanie_danych import przygotuj_dane, SEED
 from scheduler import lr_cosine
@@ -61,13 +63,17 @@ def zapisz_krzywa(historia, nazwa, log):
 
     with open(historia_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "train_acc", "val_acc", "elapsed_sec", "best"])
+        writer.writerow(["epoch", "lr", "train_loss", "train_acc", "val_acc",
+                         "val_top3", "val_f1", "elapsed_sec", "best"])
         for wiersz in historia:
             writer.writerow([
                 wiersz["epoch"],
+                wiersz["lr"],
                 wiersz["train_loss"],
                 wiersz["train_acc"],
                 wiersz["val_acc"],
+                wiersz["val_top3"],
+                wiersz["val_f1"],
                 wiersz["elapsed_sec"],
                 int(wiersz["best"]),
             ])
@@ -113,14 +119,16 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
     ile_batchy = len(train_loader)
 
     log.pisz("hiperparametry: EPOCHS=", EPOCHS, "LR=", LR,
-             "EARLY_STOP_ACC=", EARLY_STOP_ACC, "PATIENCE=", PATIENCE)
+             "EARLY_STOP_ACC=", EARLY_STOP_ACC, "PATIENCE=", PATIENCE,
+             "SCHEDULER= cosine")
     log.pisz("batchy na epoke:", ile_batchy)
     log.pisz("UWAGA: na dysk trafia NAJLEPSZY wynik (best val), NIE ostatnia epoka")
 
     for epoch in range(EPOCHS):
-        optimizer.param_groups[0]["lr"] = lr_cosine(LR, epoch, EPOCHS)
+        lr = lr_cosine(LR, epoch, EPOCHS)
+        optimizer.param_groups[0]["lr"] = lr
         t0 = time.time()
-        log.pisz("===", nazwa, "epoch", epoch + 1, "/", EPOCHS, "===")
+        log.pisz("===", nazwa, "epoch", epoch + 1, "/", EPOCHS, "| lr", round(lr, 6), "===")
         model.train()
         dobre = 0
         ile = 0
@@ -152,24 +160,16 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
         train_acc = dobre / ile
         train_loss = suma_loss / ile_batchy
 
-        model.eval()
-        dobre = 0
-        ile = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                pred = model(images).argmax(dim=1)
-                dobre = dobre + (pred == labels).sum().item()
-                ile = ile + labels.size(0)
-
-        val_acc = dobre / ile
+        m = ewaluuj(model, val_loader, device)
+        val_acc = m["acc"]
         elapsed = time.time() - t0
         log.pisz(
             "epoch", epoch + 1,
             "train_loss", round(train_loss, 4),
             "train", round(train_acc, 4),
             "val", round(val_acc, 4),
+            "val_top3", round(m["top3"], 4),
+            "val_f1", round(m["macro_f1"], 4),
             "czas", format_czas(elapsed),
         )
 
@@ -188,9 +188,12 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
 
         historia.append({
             "epoch": epoch + 1,
+            "lr": lr,
             "train_loss": train_loss,
             "train_acc": train_acc,
             "val_acc": val_acc,
+            "val_top3": m["top3"],
+            "val_f1": m["macro_f1"],
             "elapsed_sec": round(elapsed, 2),
             "best": jest_best,
         })
@@ -253,8 +256,20 @@ def main():
                          historia[-1]["epoch"] if historia else None)
                 zapisz_krzywa(historia, nazwa, log)
 
+                # TEST - na najlepszych wagach, nie na ostatniej epoce
+                model.load_state_dict(best_wagi)
+                log.sekcja("TEST")
+                m = ewaluuj(model, test_loader, device)
+                log.pisz("TEST acc:", round(m["acc"], 4),
+                         "| top3:", round(m["top3"], 4),
+                         "| macro-F1:", round(m["macro_f1"], 4))
+
+                # ANALIZA BLEDOW: confusion matrix, pomylki, przyklady
+                analiza_bledow(model, test_loader, id_to_class, device, nazwa, log)
+
                 sesja.pisz(nazwa, "OK | best epoch", best_epoch,
-                           "best val", best_val, "->", sciezka)
+                           "best val", best_val, "| TEST acc", round(m["acc"], 4),
+                           "->", sciezka)
 
                 del model
                 if torch.cuda.is_available():

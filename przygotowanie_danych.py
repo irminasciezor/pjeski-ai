@@ -12,12 +12,28 @@ from sklearn.model_selection import train_test_split
 SEED = 2718
 BATCH = 32
 IMAGES_DIR = Path("data/Images")
+NORM_MEAN = [0.485, 0.456, 0.406]
+NORM_STD = [0.229, 0.224, 0.225]
 
 
 # np. n02085620-Chihuahua -> Chihuahua
 def ladna_nazwa(folder):
     czesci = folder.split("-", 1)
     return czesci[-1]
+
+
+class DogsDataset(Dataset):
+    def __init__(self, samples, tfm):
+        self.samples = samples
+        self.tfm = tfm
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        path, label = self.samples[i]
+        img = Image.open(path).convert("RGB")
+        return self.tfm(img), label
 
 
 def przygotuj_dane():
@@ -88,30 +104,27 @@ def przygotuj_dane():
     print("val:", len(val_samples))
     print("test:", len(test_samples))
 
-    # preprocess pod ResNet (ImageNet)
-    tfm = transforms.Compose([
-        transforms.Resize((224, 224)),
+    # TRAIN: augmentacja (losowa)
+    train_tfm = transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        transforms.Normalize(NORM_MEAN, NORM_STD),
     ])
 
-    class DogsDataset(Dataset):
-        def __init__(self, samples):
-            self.samples = samples
+    # VAL / TEST: bez losowosci
+    eval_tfm = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(NORM_MEAN, NORM_STD),
+    ])
 
-        def __len__(self):
-            return len(self.samples)
-
-        def __getitem__(self, i):
-            path, label = self.samples[i]
-            img = Image.open(path)
-            img = img.convert("RGB")
-            img = tfm(img)
-            return img, label
-
-    train_loader = DataLoader(DogsDataset(train_samples), batch_size=BATCH, shuffle=True)
-    val_loader = DataLoader(DogsDataset(val_samples), batch_size=BATCH, shuffle=False)
-    test_loader = DataLoader(DogsDataset(test_samples), batch_size=BATCH, shuffle=False)
+    train_loader = DataLoader(DogsDataset(train_samples, train_tfm), batch_size=BATCH, shuffle=True)
+    val_loader = DataLoader(DogsDataset(val_samples, eval_tfm), batch_size=BATCH, shuffle=False)
+    test_loader = DataLoader(DogsDataset(test_samples, eval_tfm), batch_size=BATCH, shuffle=False)
 
     return train_loader, val_loader, test_loader, class_to_id, id_to_class, num_classes
 
