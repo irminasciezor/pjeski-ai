@@ -1,5 +1,6 @@
 import copy
 import csv
+import json
 import random
 import time
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import wandb
 
 from analiza_bledow import analiza_bledow
 from logowanie import TreningLog
@@ -23,6 +25,14 @@ MODELS = ["resnet18", "resnet50", "mobilenet"]
 EARLY_STOP_ACC = 0.83
 PATIENCE = 5
 PRINT_CO_BATCH = 20
+
+wandb: "offline"
+#wandb login, wandb sync wandb/offline-run-*  -> WANDB_OFFLINE = False
+WANDB_OFFLINE = True
+WANDB_PROJECT = "pjeski-ai"
+WANDB_WAGI = False
+
+
 
 def ustaw_device(log):
     if torch.cuda.is_available():
@@ -199,6 +209,16 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
         })
         zapisz_krzywa(historia, nazwa, log)
 
+        wandb.log({
+            "epoch": epoch + 1,
+            "lr": lr,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "val_top3": m["top3"],
+            "val_macro_f1": m["macro_f1"],
+        })
+
         if val_acc >= EARLY_STOP_ACC:
             log.pisz("stop - val >=", EARLY_STOP_ACC)
             break
@@ -231,8 +251,28 @@ def main():
                    "test batches:", len(test_loader))
         sesja.pisz("modele do treningu:", ", ".join(MODELS))
 
+        # mapa klas dla demo.ipynb
+        with open(WEIGHTS_DIR / "id_to_class.json", "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in id_to_class.items()}, f, ensure_ascii=False, indent=1)
+
         for nazwa in MODELS:
             log = TreningLog(nazwa)
+            run = wandb.init(
+                project=WANDB_PROJECT,
+                name=nazwa,
+                mode="offline" if WANDB_OFFLINE else "online",
+                config={
+                    "model": nazwa,
+                    "epochs": EPOCHS,
+                    "lr": LR,
+                    "scheduler": "cosine",
+                    "early_stop_acc": EARLY_STOP_ACC,
+                    "patience": PATIENCE,
+                    "seed": SEED,
+                    "num_classes": num_classes,
+                    "augmentacja": True,
+                },
+            )
             try:
                 log.pisz("--- MODEL:", nazwa, "---")
                 log.pisz("device:", device)
@@ -267,6 +307,23 @@ def main():
                 # ANALIZA BLEDOW: confusion matrix, pomylki, przyklady
                 analiza_bledow(model, test_loader, id_to_class, device, nazwa, log)
 
+                # wandb: podsumowanie, obrazki, wagi
+                wandb.summary["best_epoch"] = best_epoch
+                wandb.summary["best_val_acc"] = best_val
+                wandb.summary["test_acc"] = m["acc"]
+                wandb.summary["test_top3"] = m["top3"]
+                wandb.summary["test_macro_f1"] = m["macro_f1"]
+                wandb.log({
+                    "krzywa": wandb.Image(str(WYNIKI_DIR / ("krzywa_" + nazwa + ".png"))),
+                    "cm_pelna": wandb.Image(str(WYNIKI_DIR / ("cm_" + nazwa + ".png"))),
+                    "cm_zblizenie": wandb.Image(str(WYNIKI_DIR / ("cm_zblizenie_" + nazwa + ".png"))),
+                    "przyklady_bledow": wandb.Image(str(WYNIKI_DIR / ("bledy_" + nazwa + ".png"))),
+                })
+                if WANDB_WAGI:
+                    art = wandb.Artifact("wagi-" + nazwa, type="model")
+                    art.add_file(str(sciezka))
+                    run.log_artifact(art)
+
                 sesja.pisz(nazwa, "OK | best epoch", best_epoch,
                            "best val", best_val, "| TEST acc", round(m["acc"], 4),
                            "->", sciezka)
@@ -275,6 +332,7 @@ def main():
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             finally:
+                run.finish()
                 log.close()
 
         sesja.pisz("KONIEC")
