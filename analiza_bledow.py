@@ -50,7 +50,6 @@ def najczesciej_mylone(cm, k):
 def zblizenie_cm(cm, nazwy, nazwa, k=TOP_K_ZBLIZENIE):
     idx = najczesciej_mylone(cm, k)
     sub = cm[np.ix_(idx, idx)]
-    # kolor - tylko pomyłki, poprawne nie są kolorowane
     frakcja = sub / cm[idx].sum(axis=1, keepdims=True)
     frakcja_bledy = frakcja.copy()
     np.fill_diagonal(frakcja_bledy, 0)
@@ -87,7 +86,6 @@ def analiza_bledow(model, test_loader, id_to_class, device, nazwa, log):
 
     y, pred, pew = zbierz_predykcje(model, test_loader, device)
 
-    # 1. confusion matrix
     cm = confusion_matrix(y, pred, labels=list(range(n)))
     np.savetxt(WYNIKI_DIR / ("cm_" + nazwa + ".csv"), cm, fmt="%d", delimiter=",")
     rysuj_pelna_cm(cm, nazwa)
@@ -96,7 +94,6 @@ def analiza_bledow(model, test_loader, id_to_class, device, nazwa, log):
     log.pisz("rasy w zblizeniu:", ", ".join(etykiety))
     log.pisz("zapisano:", sciezka)
 
-    # 2. najczestsze pomylki (para: prawdziwa -> przewidziana)
     bez_diag = cm.copy()
     np.fill_diagonal(bez_diag, 0)
     pary = []
@@ -115,14 +112,14 @@ def analiza_bledow(model, test_loader, id_to_class, device, nazwa, log):
     for ile, a, b in pary[:10]:
         log.pisz(ile, "x", a, "->", b)
 
-    # 3. najsłabsze rasy (accuracy per klasa)
+    # ktore rasy leza najgorzej
     acc_klasy = np.diag(cm) / cm.sum(axis=1)
     najgorsze = np.argsort(acc_klasy)[:10]
     log.sekcja("NAJSLABSZE RASY")
     for i in najgorsze:
         log.pisz(nazwy[i], "acc", round(float(acc_klasy[i]), 3), "n =", int(cm[i].sum()))
 
-    # 4. przykłady błędnych predykcji - najpierw te, w których model był PEWNY
+    # bledy gdzie model byl najbardziej pewny siebie
     bledy = [i for i in range(len(y)) if y[i] != pred[i]]
     bledy.sort(key=lambda i: -pew[i])
     wybrane = bledy[:12]

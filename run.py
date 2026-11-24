@@ -10,35 +10,48 @@ import torch
 import torch.nn as nn
 import wandb
 
-from analiza_bledow import analiza_bledow
+import analiza_bledow
+from analiza_bledow import analiza_bledow as uruchom_analize_bledow
 from logowanie import TreningLog
 from metryki import ewaluuj
 from models import build_resnet18, build_resnet50, build_mobilenet
 from przygotowanie_danych import przygotuj_dane, SEED
-from scheduler import lr_cosine
+from scheduler import lr_cosine_czas
+from gpu_utils import przygotuj_gpu
+from io_utils import bezpieczny_savefig, bezpieczny_torch_save
 
-EPOCHS = 15
-LR = 0.001
+AUGMENTACJA = True
+LOAD_BEST = True
 WEIGHTS_DIR = Path("wagi")
 WYNIKI_DIR = Path("wyniki")
 MODELS = ["resnet18", "resnet50", "mobilenet"]
-EARLY_STOP_ACC = 0.83
-PATIENCE = 5
+
+LR = 1e-4  # przy 0.001 rozwalalo val na kontynuacji
+EPOCHS = 500
+EARLY_STOP_ACC = 1.01
+PATIENCE = 10**9
 PRINT_CO_BATCH = 20
 
-wandb: "offline"
-#wandb login, wandb sync wandb/offline-run-*  -> WANDB_OFFLINE = False
+CEL_CZAS_SEC = 2 * 60 * 60
+# ile juz poszlo wczesniej (zeby dopelnic do 2h)
+CZAS_JUZ_SEC = {
+    "resnet18": 2371,
+    "resnet50": 3279,
+    "mobilenet": 1893,
+}
+
 WANDB_OFFLINE = True
 WANDB_PROJECT = "pjeski-ai"
 WANDB_WAGI = False
 
 
+def max_czas_modelu(nazwa):
+    juz = CZAS_JUZ_SEC.get(nazwa, 0)
+    return max(60, CEL_CZAS_SEC - juz)
+
 
 def ustaw_device(log):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.pisz("device:", device)
     return device
 
@@ -53,15 +66,15 @@ def format_czas(sekundy):
 
 
 def zbuduj_model(name, num_classes, log):
-    if name == "resnet18":
-        return build_resnet18(num_classes)
-    elif name == "resnet50":
-        return build_resnet50(num_classes)
-    elif name == "mobilenet":
-        return build_mobilenet(num_classes)
-    else:
+    builders = {
+        "resnet18": build_resnet18,
+        "resnet50": build_resnet50,
+        "mobilenet": build_mobilenet,
+    }
+    if name not in builders:
         log.pisz("nie znam modelu:", name)
         return None
+    return builders[name](num_classes)
 
 
 def zapisz_krzywa(historia, nazwa, log):
@@ -111,40 +124,60 @@ def zapisz_krzywa(historia, nazwa, log):
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(krzywa_png, dpi=150)
-    plt.close(fig)
-    log.pisz("zapisano krzywa:", krzywa_png)
+    try:
+        bezpieczny_savefig(fig, krzywa_png, dpi=150)
+        log.pisz("zapisano krzywa:", krzywa_png)
+    except OSError as e:
+        log.pisz("png nie poszlo:", e)
+    finally:
+        plt.close(fig)
     log.pisz("zapisano historie:", historia_csv)
 
 
-def trenuj(model, train_loader, val_loader, device, nazwa, log):
+def trenuj(model, train_loader, val_loader, device, nazwa, log,
+           max_czas_sec, best_val0=-1.0, best_wagi0=None):
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    best_val = -1.0
-    best_wagi = None
-    best_epoch = None
+    best_val = best_val0
+    best_wagi = best_wagi0
+    best_epoch = 0 if best_wagi0 is not None else None
     bez_poprawy = 0
     historia = []
     ile_batchy = len(train_loader)
 
-    log.pisz("hiperparametry: EPOCHS=", EPOCHS, "LR=", LR,
-             "EARLY_STOP_ACC=", EARLY_STOP_ACC, "PATIENCE=", PATIENCE,
-             "SCHEDULER= cosine")
-    log.pisz("batchy na epoke:", ile_batchy)
-    log.pisz("UWAGA: na dysk trafia NAJLEPSZY wynik (best val), NIE ostatnia epoka")
+    log.pisz("LR=", LR, "max_czas=", format_czas(max_czas_sec),
+             "juz=", format_czas(CZAS_JUZ_SEC.get(nazwa, 0)),
+             "batchy=", ile_batchy)
 
-    for epoch in range(EPOCHS):
-        lr = lr_cosine(LR, epoch, EPOCHS)
+    t_start = time.time()
+
+    for i in range(EPOCHS):
+        if time.time() - t_start >= max_czas_sec:
+            log.pisz("hardstop", format_czas(max_czas_sec), "przed epoka", i + 1)
+            break
+
+        lr = lr_cosine_czas(LR, time.time() - t_start, max_czas_sec)
         optimizer.param_groups[0]["lr"] = lr
         t0 = time.time()
-        log.pisz("===", nazwa, "epoch", epoch + 1, "/", EPOCHS, "| lr", round(lr, 6), "===")
+        epoch_nr = i + 1
+        log.pisz("===", nazwa, "epoch", epoch_nr,
+                 "| lr", round(lr, 6),
+                 "| czas", format_czas(time.time() - t_start), "/",
+                 format_czas(max_czas_sec), "===")
         model.train()
         dobre = 0
         ile = 0
         suma_loss = 0.0
+        hardstop = False
 
-        for i, (images, labels) in enumerate(train_loader, start=1):
+        for bi, (images, labels) in enumerate(train_loader, start=1):
+            if time.time() - t_start >= max_czas_sec:
+                log.pisz("stop - hardstop", format_czas(max_czas_sec),
+                         "w epoce", epoch_nr, "batch", bi, "/", ile_batchy)
+                hardstop = True
+                break
+
             images = images.to(device)
             labels = labels.to(device)
 
@@ -159,13 +192,17 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
             ile = ile + labels.size(0)
             suma_loss = suma_loss + loss.item()
 
-            if i == 1 or i % PRINT_CO_BATCH == 0 or i == ile_batchy:
+            if bi == 1 or bi % PRINT_CO_BATCH == 0 or bi == ile_batchy:
                 acc_teraz = dobre / ile
                 log.pisz(
-                    "  batch", i, "/", ile_batchy,
+                    "  batch", bi, "/", ile_batchy,
                     "loss", round(loss.item(), 4),
                     "acc", round(acc_teraz, 4),
+                    "| razem", format_czas(time.time() - t_start),
                 )
+
+        if hardstop or ile == 0:
+            break
 
         train_acc = dobre / ile
         train_loss = suma_loss / ile_batchy
@@ -174,30 +211,30 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
         val_acc = m["acc"]
         elapsed = time.time() - t0
         log.pisz(
-            "epoch", epoch + 1,
+            "epoch", epoch_nr,
             "train_loss", round(train_loss, 4),
             "train", round(train_acc, 4),
             "val", round(val_acc, 4),
             "val_top3", round(m["top3"], 4),
             "val_f1", round(m["macro_f1"], 4),
             "czas", format_czas(elapsed),
+            "| razem", format_czas(time.time() - t_start),
         )
 
         jest_best = False
         if val_acc > best_val:
             best_val = val_acc
             best_wagi = copy.deepcopy(model.state_dict())
-            best_epoch = epoch + 1
+            best_epoch = epoch_nr
             bez_poprawy = 0
             jest_best = True
-            log.pisz("  NOWE BEST -> epoka", best_epoch, "val", round(best_val, 4))
+            log.pisz("  best ep", best_epoch, "val", round(best_val, 4))
         else:
             bez_poprawy = bez_poprawy + 1
-            log.pisz("  brak poprawy,", bez_poprawy, "/", PATIENCE,
-                     "| aktualne best: epoka", best_epoch, "val", round(best_val, 4))
+            log.pisz("  bez poprawy", bez_poprawy, "| best", round(best_val, 4))
 
         historia.append({
-            "epoch": epoch + 1,
+            "epoch": epoch_nr,
             "lr": lr,
             "train_loss": train_loss,
             "train_acc": train_acc,
@@ -210,7 +247,7 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
         zapisz_krzywa(historia, nazwa, log)
 
         wandb.log({
-            "epoch": epoch + 1,
+            "epoch": epoch_nr,
             "lr": lr,
             "train_loss": train_loss,
             "train_acc": train_acc,
@@ -227,50 +264,71 @@ def trenuj(model, train_loader, val_loader, device, nazwa, log):
             log.pisz("stop - brak poprawy przez", PATIENCE, "epoki")
             break
 
+        if time.time() - t_start >= max_czas_sec:
+            log.pisz("stop - hardstop", format_czas(max_czas_sec),
+                     "po epoce", epoch_nr)
+            break
+
+    log.pisz("czas calego modelu (ta sesja):", format_czas(time.time() - t_start))
     return best_wagi, best_val, best_epoch, historia
 
 
 def main():
-    if not WEIGHTS_DIR.exists():
-        WEIGHTS_DIR.mkdir()
+    WEIGHTS_DIR.mkdir(exist_ok=True)
+    WYNIKI_DIR.mkdir(exist_ok=True)
+    analiza_bledow.WYNIKI_DIR = WYNIKI_DIR
 
-    # wspolny log sesji + osobne logi per model
     sesja = TreningLog("run_sesja")
     try:
         sesja.pisz("START")
+        sesja.pisz("tryb: augmentacja=", AUGMENTACJA, "| LOAD_BEST=", LOAD_BEST,
+                   "| wagi:", WEIGHTS_DIR, "| wyniki:", WYNIKI_DIR)
         random.seed(SEED)
         torch.manual_seed(SEED)
+        przygotuj_gpu(sesja)
 
         device = ustaw_device(sesja)
 
         sesja.sekcja("DANE")
-        train_loader, val_loader, test_loader, class_to_id, id_to_class, num_classes = przygotuj_dane()
+        train_loader, val_loader, test_loader, class_to_id, id_to_class, num_classes = przygotuj_dane(
+            augmentacja=AUGMENTACJA
+        )
         sesja.pisz("num_classes:", num_classes)
+        sesja.pisz("augmentacja:", AUGMENTACJA)
         sesja.pisz("train batches:", len(train_loader),
                    "val batches:", len(val_loader),
                    "test batches:", len(test_loader))
         sesja.pisz("modele do treningu:", ", ".join(MODELS))
+        for n in MODELS:
+            sesja.pisz(
+                n, "| juz:", format_czas(CZAS_JUZ_SEC.get(n, 0)),
+                "| teraz max:", format_czas(max_czas_modelu(n)),
+                "| scheduler: cosine po czasie",
+            )
 
-        # mapa klas dla demo.ipynb
         with open(WEIGHTS_DIR / "id_to_class.json", "w", encoding="utf-8") as f:
             json.dump({str(k): v for k, v in id_to_class.items()}, f, ensure_ascii=False, indent=1)
 
         for nazwa in MODELS:
             log = TreningLog(nazwa)
+            max_czas = max_czas_modelu(nazwa)
             run = wandb.init(
                 project=WANDB_PROJECT,
-                name=nazwa,
+                name=nazwa + "_z_aug_cont",
                 mode="offline" if WANDB_OFFLINE else "online",
                 config={
                     "model": nazwa,
-                    "epochs": EPOCHS,
+                    "epochs_max": EPOCHS,
                     "lr": LR,
-                    "scheduler": "cosine",
+                    "scheduler": "cosine_czas",
                     "early_stop_acc": EARLY_STOP_ACC,
                     "patience": PATIENCE,
+                    "max_czas_sec": max_czas,
+                    "czas_juz_sec": CZAS_JUZ_SEC.get(nazwa, 0),
                     "seed": SEED,
                     "num_classes": num_classes,
-                    "augmentacja": True,
+                    "augmentacja": AUGMENTACJA,
+                    "load_best": LOAD_BEST,
                 },
             )
             try:
@@ -278,25 +336,42 @@ def main():
                 log.pisz("device:", device)
 
                 model = zbuduj_model(nazwa, num_classes, log)
-                model = model.to(device)
+                sciezka = WEIGHTS_DIR / (nazwa + ".pt")
+                best_val0 = -1.0
+                best_wagi0 = None
+
+                if LOAD_BEST and sciezka.exists():
+                    state = torch.load(sciezka, map_location="cpu", weights_only=True)
+                    model.load_state_dict(state)
+                    log.pisz("wczytano:", sciezka)
+                    model = model.to(device)
+                    m0 = ewaluuj(model, val_loader, device)
+                    best_val0 = m0["acc"]
+                    best_wagi0 = copy.deepcopy(model.state_dict())
+                    log.pisz("start z dysku val", round(best_val0, 4),
+                             "top3", round(m0["top3"], 4))
+                else:
+                    log.pisz("start od ImageNet")
+                    model = model.to(device)
 
                 log.sekcja("TRENING")
                 best_wagi, best_val, best_epoch, historia = trenuj(
-                    model, train_loader, val_loader, device, nazwa, log
+                    model, train_loader, val_loader, device, nazwa, log,
+                    max_czas_sec=max_czas,
+                    best_val0=best_val0,
+                    best_wagi0=best_wagi0,
                 )
 
-                sciezka = WEIGHTS_DIR / (nazwa + ".pt")
-                log.sekcja("ZAPIS WAG")
-                torch.save(best_wagi, sciezka)
-                log.pisz("zapisano NAJLEPSZE wagi (nie ostatnia epoka)")
-                log.pisz("plik:", sciezka)
-                log.pisz("best epoch:", best_epoch)
-                log.pisz("best val:", best_val)
-                log.pisz("ostatnia epoka w historii:",
-                         historia[-1]["epoch"] if historia else None)
-                zapisz_krzywa(historia, nazwa, log)
+                if best_wagi is None:
+                    log.pisz("BRAK wag do zapisu - pomijam")
+                    continue
 
-                # TEST - na najlepszych wagach, nie na ostatniej epoce
+                log.sekcja("ZAPIS WAG")
+                bezpieczny_torch_save(best_wagi, sciezka)
+                log.pisz("zapisano:", sciezka, "best ep", best_epoch, "val", best_val)
+                if historia:
+                    zapisz_krzywa(historia, nazwa, log)
+
                 model.load_state_dict(best_wagi)
                 log.sekcja("TEST")
                 m = ewaluuj(model, test_loader, device)
@@ -304,10 +379,8 @@ def main():
                          "| top3:", round(m["top3"], 4),
                          "| macro-F1:", round(m["macro_f1"], 4))
 
-                # ANALIZA BLEDOW: confusion matrix, pomylki, przyklady
-                analiza_bledow(model, test_loader, id_to_class, device, nazwa, log)
+                uruchom_analize_bledow(model, test_loader, id_to_class, device, nazwa, log)
 
-                # wandb: podsumowanie, obrazki, wagi
                 wandb.summary["best_epoch"] = best_epoch
                 wandb.summary["best_val_acc"] = best_val
                 wandb.summary["test_acc"] = m["acc"]

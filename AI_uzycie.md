@@ -1,13 +1,35 @@
 # Użycie AI
 
-W trakcie realizacji projektu korzystano z narzędzi AI (ChatGPT, Cursor) wspomagająco — głównie przy wyjaśnianiu wymagań, weryfikacji podejścia oraz diagnostyce błędów (m.in. konfiguracja GPU, format zapisanych wag). Decyzje projektowe oraz implementacja (dobór modeli, podział danych, early stopping na zbiorze walidacyjnym, harmonogram cosine dla learning rate) pozostawały po stronie autorów.
+Korzystałyśmy z ChatGPT i Cursora jako wsparcia — do dopytywania wymagań, debugowania i weryfikacji pomysłów.  
+Dobór modeli (ResNet-18/50, MobileNet), podział danych, early stop na val, cosine LR, augmentacja i porównanie transferu (Pets / Food-101) to nasze decyzje. AI nie pisało projektu „od zera”.
 
-Przykładowe zagadnienia, w których AI służyło jako wsparcie merytoryczne:
+## Do czego konkretnie
 
-- różnica między early stopping na zbiorze walidacyjnym a monitorowaniem accuracy na zbiorze treningowym
-- czy cosine decay learning rate spełnia wymóg własnego schedulera, czy wymagana jest osobna klasa
-- sprawdzenie dostępności CUDA w PyTorch oraz możliwość równoległego uruchomienia dwóch procesów treningowych
-- różnice w strukturze checkpointów pobranych z Hugging Face (`model_state` vs bezpośredni `state_dict`)
-- sposób uczciwego porównania w raporcie modeli startujących z ImageNet oraz z wag Oxford Pets / Food-101
+- wyjaśnienie early stop: val vs train accuracy  
+- czy cosine decay wystarczy jako „własny scheduler”  
+- CUDA / cuDNN (crashe po długim treningu)  
+- format wag z Hugging Face (`model_state` vs zwykły `state_dict`)  
+- jak uczciwie porównać ImageNet vs Pets vs Food w raporcie  
+- OneDrive blokujący zapis PNG (`Errno 22`)  
+- kontynuacja treningu z checkpointu i limit czasu ~2h  
 
-Narzędzia AI nie były wykorzystywane do generowania całego projektu „od zera”, lecz do konsultacji szczegółów technicznych i treści raportu.
+## Przykładowe prompty (realistyczne)
+
+1. *„Mamy early stop na val_acc >= 0.83 i patience 5. Czy to jest early stopping na walidacji, czy wystarczy patrzeć na train acc? Projekt wymaga early stop.”*
+
+2. *„Potrzebujemy własnego schedulera LR. Czy funkcja cosine decay w stylu lr = lr0 * 0.5 * (1 + cos(pi * epoch / epochs)) się liczy, czy muszą być osobna klasa i step()?”*
+
+3. *„Ładuję wagi Oxford Pets z HF do ResNet50. W pliku jest `model_state`, a torchvision oczekuje state_dict. Jak to wczytać i potem podmienić głowę na 120 klas Stanford Dogs?”*
+
+4. *„Trening leci na RTX 4050, po kilku godzinach wali `CUDNN_STATUS_EXECUTION_FAILED` / `BAD_PARAM_STREAM_MISMATCH` przy backward. Co zrobić żeby nocny run nie padał?”*
+
+5. *„`fig.savefig('wyniki/krzywa_....png')` na OneDrive rzuca `OSError: [Errno 22] Invalid argument`. Jak zapisać wykres żeby trening się nie wywalił w połowie epoki?”*
+
+6. *„Mamy już wagi po 15 epokach (~40–55 min). Chcemy douczyć do łącznie 2h z tymi samymi wagami, bez startu od ImageNet. Cosine ma spadać w tej sesji. Jak to ustawić?”*
+
+7. *„Bez aug żaden model nie dobił 80% test. Aug na ResNet50 daje ~79%. Co sensownie dorzucić do raportu: top-1…top-5, porównanie Pets/Food, bez obiecywania cudów.”*
+
+## Czego AI nie robiło
+
+Nie wybierało architektury za nas, nie ustalało podziału 80/10/10 ani metryk do oddania.  
+Kod i wyniki przechodziły przez nas — AI głównie do konsultacji i gaszenia pożarów (GPU, ścieżki, format checkpointów).

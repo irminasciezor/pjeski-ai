@@ -13,29 +13,35 @@ import matplotlib.pyplot as plt
 
 from przygotowanie_danych import przygotuj_dane, SEED
 from logowanie import TreningLog
-from scheduler import lr_cosine
+from metryki import ewaluuj
+from scheduler import lr_cosine_czas
+from gpu_utils import przygotuj_gpu
+from io_utils import bezpieczny_savefig, bezpieczny_torch_save
 
 
-# food-101 resnet50, potem glowa pod psy
+# food-101 -> psy
 URL_WAG = "https://huggingface.co/VinnyVortex004/Food101-Classifier/resolve/main/food101_model.pth"
 WAGI_FOOD = Path("wagi/jedzenie_food101_resnet50.pth")
 WAGI_OUT = Path("wagi/douczanie_jedzenie_dogs.pt")
 WYNIKI_DIR = Path("wyniki")
 
-EPOCHS = 15
-LR = 0.001
-EARLY_STOP_ACC = 0.83
-PATIENCE = 5
+AUGMENTACJA = True
+LOAD_BEST = True
+EPOCHS = 500
+LR = 1e-4
+EARLY_STOP_ACC = 1.01
+PATIENCE = 10**9
 KLAS_FOOD = 101
 PRINT_CO_BATCH = 20
 
+MAX_CZAS_SEC = 2 * 60 * 60
+CEL_CZAS_SEC = MAX_CZAS_SEC
+CZAS_JUZ_SEC = 0
+
 
 def ustaw_device(log):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    log.pisz("food run na:", device, "(cuda dostepne:", torch.cuda.is_available(), ")")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.pisz("device:", device)
     return device
 
 
@@ -63,19 +69,27 @@ def pobierz_wagi_jedzenie(log):
     log.pisz("ok, mam:", WAGI_FOOD)
 
 
-def zrob_model(num_classes, log):
+def zrob_model_od_food(num_classes, log):
     model = models.resnet50(weights=None)
     ile = model.fc.in_features
     model.fc = nn.Linear(ile, KLAS_FOOD)
 
     pobierz_wagi_jedzenie(log)
-    # ten plik z HF to od razu state_dict
     state = torch.load(WAGI_FOOD, map_location="cpu", weights_only=False)
     model.load_state_dict(state)
     log.pisz("zaladowalam food (101 klas)")
 
     model.fc = nn.Linear(ile, num_classes)
     log.pisz("glowa pod psy:", num_classes)
+    return model
+
+
+def zrob_model_kontynuacja(num_classes, log):
+    model = models.resnet50(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    state = torch.load(WAGI_OUT, map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
+    log.pisz("wczytano kontynuacje z:", WAGI_OUT)
     return model
 
 
@@ -86,10 +100,10 @@ def zapisz_wyniki(historia, log):
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "train_acc", "val_acc", "elapsed_sec", "best"])
+        writer.writerow(["epoch", "lr", "train_loss", "train_acc", "val_acc", "elapsed_sec", "best"])
         for w in historia:
             writer.writerow([
-                w["epoch"], w["train_loss"], w["train_acc"],
+                w["epoch"], w["lr"], w["train_loss"], w["train_acc"],
                 w["val_acc"], w["elapsed_sec"], int(w["best"]),
             ])
 
@@ -106,35 +120,52 @@ def zapisz_wyniki(historia, log):
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(png_path, dpi=150)
-    plt.close(fig)
-    log.pisz("wyniki:", csv_path, "i", png_path)
+    try:
+        bezpieczny_savefig(fig, png_path, dpi=150)
+        log.pisz("wyniki:", csv_path, "i", png_path)
+    except OSError as e:
+        log.pisz("png nie poszlo:", e)
+    finally:
+        plt.close(fig)
 
 
-def trenuj(model, train_loader, val_loader, device, log):
+def trenuj(model, train_loader, val_loader, device, log, best_val0=-1.0, best_wagi0=None):
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    best_val = -1.0
-    best_wagi = None
-    best_epoch = None
+    best_val = best_val0
+    best_wagi = best_wagi0
+    best_epoch = 0 if best_wagi0 is not None else None
     bez_poprawy = 0
     historia = []
     ile_batchy = len(train_loader)
 
-    log.pisz("food:", EPOCHS, "rund, lr", LR, "| early", EARLY_STOP_ACC, "lub", PATIENCE, "staly val")
-    log.pisz("train loader:", ile_batchy, "batchy; po kazdej epoce aktualizuje wyniki/")
+    log.pisz("lr", LR, "max", format_czas(MAX_CZAS_SEC), "batchy", ile_batchy)
+
+    t_start = time.time()
 
     for epoch in range(EPOCHS):
-        optimizer.param_groups[0]["lr"] = lr_cosine(LR, epoch, EPOCHS)
+        if time.time() - t_start >= MAX_CZAS_SEC:
+            log.pisz("stop - hardstop", format_czas(MAX_CZAS_SEC))
+            break
+
+        lr = lr_cosine_czas(LR, time.time() - t_start, MAX_CZAS_SEC)
+        optimizer.param_groups[0]["lr"] = lr
         t0 = time.time()
-        log.pisz("epoka", epoch + 1, "/", EPOCHS)
+        log.pisz("epoka", epoch + 1, "| lr", round(lr, 6),
+                 "|", format_czas(time.time() - t_start), "/", format_czas(MAX_CZAS_SEC))
         model.train()
         dobre = 0
         ile = 0
         suma_loss = 0.0
+        hardstop = False
 
         for i, (images, labels) in enumerate(train_loader, start=1):
+            if time.time() - t_start >= MAX_CZAS_SEC:
+                log.pisz("stop - hardstop w epoce", epoch + 1, "batch", i)
+                hardstop = True
+                break
+
             images = images.to(device)
             labels = labels.to(device)
 
@@ -154,24 +185,18 @@ def trenuj(model, train_loader, val_loader, device, log):
                          "loss", round(loss.item(), 4),
                          "acc", round(dobre / ile, 4))
 
+        if hardstop or ile == 0:
+            break
+
         train_acc = dobre / ile
         train_loss = suma_loss / ile_batchy
 
-        model.eval()
-        dobre = 0
-        ile = 0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                pred = model(images).argmax(dim=1)
-                dobre = dobre + (pred == labels).sum().item()
-                ile = ile + labels.size(0)
-
-        val_acc = dobre / ile
+        m = ewaluuj(model, val_loader, device)
+        val_acc = m["acc"]
         elapsed = time.time() - t0
         log.pisz("-> train", round(train_acc, 4), "val", round(val_acc, 4),
-                 "loss", round(train_loss, 4), format_czas(elapsed))
+                 "loss", round(train_loss, 4), format_czas(elapsed),
+                 "| razem", format_czas(time.time() - t_start))
 
         jest_best = False
         if val_acc > best_val:
@@ -187,14 +212,17 @@ def trenuj(model, train_loader, val_loader, device, log):
 
         historia.append({
             "epoch": epoch + 1,
+            "lr": lr,
             "train_loss": train_loss,
             "train_acc": train_acc,
             "val_acc": val_acc,
             "elapsed_sec": round(elapsed, 2),
             "best": jest_best,
         })
-        # zapisuje po drodze, zeby nie stracic jak padnie
-        zapisz_wyniki(historia, log)
+        try:
+            zapisz_wyniki(historia, log)
+        except OSError as e:
+            log.pisz("zapis wynikow padl, lecimy dalej:", e)
 
         if val_acc >= EARLY_STOP_ACC:
             log.pisz("early stop (acc)")
@@ -202,32 +230,67 @@ def trenuj(model, train_loader, val_loader, device, log):
         if bez_poprawy >= PATIENCE:
             log.pisz("early stop (patience)")
             break
+        if time.time() - t_start >= MAX_CZAS_SEC:
+            log.pisz("stop - hardstop po epoce", epoch + 1)
+            break
 
+    log.pisz("czas calego modelu (ta sesja):", format_czas(time.time() - t_start))
     return best_wagi, best_val, best_epoch, historia
 
 
 def main():
     log = TreningLog("douczanie_jedzenie")
-    log.pisz("start: food -> psy")
-    random.seed(SEED)
-    torch.manual_seed(SEED)
+    try:
+        log.pisz("START food -> psy")
+        random.seed(SEED)
+        torch.manual_seed(SEED)
+        przygotuj_gpu(log)
 
-    device = ustaw_device(log)
+        device = ustaw_device(log)
 
-    train_loader, val_loader, test_loader, class_to_id, id_to_class, num_classes = przygotuj_dane()
-    log.pisz("klas:", num_classes, "train/val/test batches:",
-             len(train_loader), len(val_loader), len(test_loader))
+        train_loader, val_loader, test_loader, class_to_id, id_to_class, num_classes = przygotuj_dane(
+            augmentacja=AUGMENTACJA
+        )
+        log.pisz("klas:", num_classes, "| augmentacja:", AUGMENTACJA,
+                 "train/val/test batches:",
+                 len(train_loader), len(val_loader), len(test_loader))
+        log.pisz("max czas tej sesji:", format_czas(MAX_CZAS_SEC))
 
-    model = zrob_model(num_classes, log).to(device)
-    best_wagi, best_val, best_epoch, historia = trenuj(
-        model, train_loader, val_loader, device, log
-    )
+        best_val0 = -1.0
+        best_wagi0 = None
+        if LOAD_BEST and WAGI_OUT.exists():
+            model = zrob_model_kontynuacja(num_classes, log).to(device)
+            m0 = ewaluuj(model, val_loader, device)
+            best_val0 = m0["acc"]
+            best_wagi0 = copy.deepcopy(model.state_dict())
+            log.pisz("z dysku val", round(best_val0, 4), "top3", round(m0["top3"], 4))
+        else:
+            model = zrob_model_od_food(num_classes, log).to(device)
+            log.pisz("brak checkpointu, od Food-101")
 
-    torch.save(best_wagi, WAGI_OUT)
-    log.pisz("zapisane:", WAGI_OUT, "best ep", best_epoch, "val", best_val)
-    zapisz_wyniki(historia, log)
-    log.pisz("koniec jedzenie")
-    log.close()
+        best_wagi, best_val, best_epoch, historia = trenuj(
+            model, train_loader, val_loader, device, log,
+            best_val0=best_val0, best_wagi0=best_wagi0,
+        )
+
+        if best_wagi is None:
+            log.pisz("BRAK wag do zapisu")
+            return
+
+        bezpieczny_torch_save(best_wagi, WAGI_OUT)
+        log.pisz("zapisane:", WAGI_OUT, "best ep", best_epoch, "val", best_val)
+        if historia:
+            zapisz_wyniki(historia, log)
+
+        log.sekcja("TEST")
+        model.load_state_dict(best_wagi)
+        m = ewaluuj(model, test_loader, device)
+        log.pisz("test_acc:", round(m["acc"], 4),
+                 "| top3:", round(m["top3"], 4),
+                 "| macro-F1:", round(m["macro_f1"], 4))
+        log.pisz("koniec jedzenie")
+    finally:
+        log.close()
 
 
 if __name__ == "__main__":

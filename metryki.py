@@ -17,7 +17,6 @@ def ewaluuj(model, loader, device):
             wyjscie = model(images)
 
             pred = wyjscie.argmax(dim=1)
-            # [batch, 3]
             top3 = wyjscie.topk(3, dim=1).indices
 
             dobre += (pred == labels).sum().item()

@@ -1,0 +1,6 @@
+model,test_acc,top3,macro_f1
+resnet18,0.6064,0.8192,0.6003
+resnet50,0.7196,0.8921,0.7121
+mobilenet,0.7352,0.8999,0.728
+douczanie_pets,0.7128,0.8916,0.7087
+douczanie_jedzenie,0.3047,0.5335,0.2944
