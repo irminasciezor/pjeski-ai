@@ -25,9 +25,8 @@ Dobór modeli (ResNet-18/50, MobileNet), podział danych, early stop na val, cos
 
 5. *„`fig.savefig('wyniki/krzywa_....png')` na OneDrive rzuca `OSError: [Errno 22] Invalid argument`. Jak zapisać wykres żeby trening się nie wywalił w połowie epoki?”*
 
-6. *„Mamy już wagi po 15 epokach (~40–55 min). Chcemy douczyć do łącznie 2h z tymi samymi wagami, bez startu od ImageNet. Cosine ma spadać w tej sesji. Jak to ustawić?”*
+6. *„Mamy już wagi po 15 epokach. Chcemy douczyć do łącznie 2h z tymi samymi wagami, bez startu od ImageNet. Cosine ma spadać w tej sesji. Jak to ustawić?”*
 
-7. *„Bez aug żaden model nie dobił 80% test. Aug na ResNet50 daje ~79%. Co sensownie dorzucić do raportu: top-1…top-5, porównanie Pets/Food, bez obiecywania cudów.”*
 
 ## Czego AI nie robiło
 
